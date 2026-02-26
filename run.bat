@@ -1,0 +1,3 @@
+@echo off
+echo Starting Bluetooth Battery Monitor...
+python bluetooth_battery_monitor.py
