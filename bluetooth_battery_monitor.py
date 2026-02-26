@@ -7,6 +7,11 @@ from PyQt5.QtGui import QIcon, QPixmap, QPainter, QFont, QColor
 from PyQt5.QtCore import QTimer, Qt
 from bleak import BleakScanner, BleakClient
 import winreg
+try:
+    import wmi
+    WMI_AVAILABLE = True
+except ImportError:
+    WMI_AVAILABLE = False
 
 
 class BluetoothBatteryMonitor:
@@ -130,9 +135,14 @@ class BluetoothBatteryMonitor:
             try:
                 self.scan_count += 1
                 print(f"[Scan #{self.scan_count}] Starting Bluetooth scan...")
+                
+                # Scan for Windows paired/connected Bluetooth devices
+                await self.scan_windows_bluetooth()
+                
+                # Scan for BLE devices
                 devices = await BleakScanner.discover(timeout=8.0)
                 
-                print(f"[Scan #{self.scan_count}] Found {len(devices)} total devices")
+                print(f"[Scan #{self.scan_count}] Found {len(devices)} BLE devices")
                 
                 for device in devices:
                     device_name = device.name if device.name else "Unknown"
@@ -142,7 +152,8 @@ class BluetoothBatteryMonitor:
                         self.all_devices[device.address] = {
                             'name': device_name,
                             'address': device.address,
-                            'rssi': getattr(device, 'rssi', None)
+                            'rssi': getattr(device, 'rssi', None),
+                            'type': 'BLE'
                         }
                         
                         battery_level = await self.get_battery_level(device)
@@ -157,7 +168,7 @@ class BluetoothBatteryMonitor:
                         else:
                             print(f"    ✗ No battery service available")
                 
-                print(f"[Scan #{self.scan_count}] Devices with battery: {len(self.devices)}")
+                print(f"[Scan #{self.scan_count}] Total devices: {len(self.all_devices)}, with battery: {len(self.devices)}")
                 self.last_error = None
                 await asyncio.sleep(15)
             except Exception as e:
@@ -165,6 +176,56 @@ class BluetoothBatteryMonitor:
                 print(f"[Scan #{self.scan_count}] {error_msg}")
                 self.last_error = str(e)
                 await asyncio.sleep(15)
+    
+    async def scan_windows_bluetooth(self):
+        """Scan for paired/connected Classic Bluetooth devices using Windows API"""
+        try:
+            if WMI_AVAILABLE:
+                c = wmi.WMI()
+                # Query Win32_PnPEntity for Bluetooth devices
+                for device in c.Win32_PnPEntity():
+                    if device.Name and 'bluetooth' in device.Name.lower():
+                        # Skip Bluetooth adapters themselves
+                        if 'adapter' in device.Name.lower() or 'radio' in device.Name.lower():
+                            continue
+                        
+                        device_id = device.DeviceID if device.DeviceID else device.PNPDeviceID
+                        if device_id:
+                            print(f"  [Windows] {device.Name} (Status: {device.Status})")
+                            self.all_devices[device_id] = {
+                                'name': device.Name,
+                                'address': device_id,
+                                'rssi': None,
+                                'type': 'Classic BT',
+                                'status': device.Status
+                            }
+                            
+                            # Try to get battery level from Windows
+                            battery = self.get_windows_battery(device)
+                            if battery is not None:
+                                print(f"    ✓ Battery: {battery}%")
+                                self.devices[device_id] = {
+                                    'name': device.Name,
+                                    'battery': battery,
+                                    'device': device
+                                }
+            else:
+                print("  [Windows] WMI not available, skipping Classic Bluetooth scan")
+        except Exception as e:
+            print(f"  [Windows] Error scanning Classic Bluetooth: {e}")
+    
+    def get_windows_battery(self, device):
+        """Try to get battery level from Windows device properties"""
+        try:
+            if WMI_AVAILABLE:
+                c = wmi.WMI()
+                # Try to find battery information
+                for battery in c.Win32_Battery():
+                    if battery.EstimatedChargeRemaining:
+                        return int(battery.EstimatedChargeRemaining)
+        except:
+            pass
+        return None
     
     async def get_battery_level(self, device):
         try:
@@ -216,8 +277,10 @@ class BluetoothBatteryMonitor:
                 
                 for address, info in self.all_devices.items():
                     if address not in self.devices:
-                        rssi_text = f" ({info['rssi']} dBm)" if info['rssi'] else ""
-                        device_text = f"📡 {info['name']}{rssi_text}"
+                        device_type = info.get('type', 'Unknown')
+                        rssi_text = f" ({info['rssi']} dBm)" if info.get('rssi') else ""
+                        status_text = f" [{info.get('status', 'Unknown')}]" if 'status' in info else ""
+                        device_text = f"📡 {info['name']} ({device_type}){rssi_text}{status_text}"
                         device_action = QAction(device_text, self.app)
                         device_action.setEnabled(False)
                         self.menu.insertAction(self.help_action, device_action)
@@ -244,8 +307,10 @@ class BluetoothBatteryMonitor:
                 self.menu.insertAction(self.help_action, separator)
                 
                 for address, info in self.all_devices.items():
-                    rssi_text = f" ({info['rssi']} dBm)" if info['rssi'] else ""
-                    device_text = f"📡 {info['name']}{rssi_text}"
+                    device_type = info.get('type', 'Unknown')
+                    rssi_text = f" ({info['rssi']} dBm)" if info.get('rssi') else ""
+                    status_text = f" [{info.get('status', 'Unknown')}]" if 'status' in info else ""
+                    device_text = f"📡 {info['name']} ({device_type}){rssi_text}{status_text}"
                     device_action = QAction(device_text, self.app)
                     device_action.setEnabled(False)
                     self.menu.insertAction(self.help_action, device_action)
