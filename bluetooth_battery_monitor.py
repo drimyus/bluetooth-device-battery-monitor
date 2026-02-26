@@ -15,11 +15,14 @@ class BluetoothBatteryMonitor:
         self.app.setQuitOnLastWindowClosed(False)
         
         self.devices = {}
+        self.all_devices = {}
         self.tray_icon = None
         self.menu = None
         self.scanner_running = False
         self.loop = None
         self.thread = None
+        self.scan_count = 0
+        self.last_error = None
         
         self.setup_tray_icon()
         self.start_monitoring()
@@ -73,17 +76,33 @@ class BluetoothBatteryMonitor:
         
         self.menu = QMenu()
         
+        self.status_action = QAction("Scanning...", self.app)
+        self.status_action.setEnabled(False)
+        self.menu.addAction(self.status_action)
+        
+        self.menu.addSeparator()
+        
         self.refresh_action = QAction("Refresh Devices", self.app)
         self.refresh_action.triggered.connect(self.manual_refresh)
         self.menu.addAction(self.refresh_action)
         
+        self.show_all_action = QAction("Show All Devices", self.app)
+        self.show_all_action.setCheckable(True)
+        self.show_all_action.setChecked(False)
+        self.show_all_action.triggered.connect(self.update_device_list)
+        self.menu.addAction(self.show_all_action)
+        
         self.menu.addSeparator()
         
-        self.devices_label = QAction("No devices found", self.app)
+        self.devices_label = QAction("No devices with battery found", self.app)
         self.devices_label.setEnabled(False)
         self.menu.addAction(self.devices_label)
         
         self.menu.addSeparator()
+        
+        self.help_action = QAction("Help / Troubleshooting", self.app)
+        self.help_action.triggered.connect(self.show_help)
+        self.menu.addAction(self.help_action)
         
         self.quit_action = QAction("Exit", self.app)
         self.quit_action.triggered.connect(self.quit_app)
@@ -109,27 +128,47 @@ class BluetoothBatteryMonitor:
     async def scan_devices(self):
         while self.scanner_running:
             try:
-                devices = await BleakScanner.discover(timeout=5.0)
+                self.scan_count += 1
+                print(f"[Scan #{self.scan_count}] Starting Bluetooth scan...")
+                devices = await BleakScanner.discover(timeout=8.0)
+                
+                print(f"[Scan #{self.scan_count}] Found {len(devices)} total devices")
                 
                 for device in devices:
-                    if device.name and device.address:
+                    device_name = device.name if device.name else "Unknown"
+                    print(f"  - {device_name} ({device.address})")
+                    
+                    if device.address:
+                        self.all_devices[device.address] = {
+                            'name': device_name,
+                            'address': device.address,
+                            'rssi': getattr(device, 'rssi', None)
+                        }
+                        
                         battery_level = await self.get_battery_level(device)
                         
                         if battery_level is not None:
+                            print(f"    ✓ Battery: {battery_level}%")
                             self.devices[device.address] = {
-                                'name': device.name,
+                                'name': device_name,
                                 'battery': battery_level,
                                 'device': device
                             }
+                        else:
+                            print(f"    ✗ No battery service available")
                 
-                await asyncio.sleep(10)
+                print(f"[Scan #{self.scan_count}] Devices with battery: {len(self.devices)}")
+                self.last_error = None
+                await asyncio.sleep(15)
             except Exception as e:
-                print(f"Error scanning devices: {e}")
-                await asyncio.sleep(10)
+                error_msg = f"Error scanning devices: {e}"
+                print(f"[Scan #{self.scan_count}] {error_msg}")
+                self.last_error = str(e)
+                await asyncio.sleep(15)
     
     async def get_battery_level(self, device):
         try:
-            async with BleakClient(device.address, timeout=5.0) as client:
+            async with BleakClient(device.address, timeout=10.0) as client:
                 if client.is_connected:
                     battery_service_uuid = "0000180f-0000-1000-8000-00805f9b34fb"
                     battery_char_uuid = "00002a19-0000-1000-8000-00805f9b34fb"
@@ -143,25 +182,45 @@ class BluetoothBatteryMonitor:
                                     value = await client.read_gatt_char(char.uuid)
                                     return int(value[0])
         except Exception as e:
-            pass
+            print(f"    Error reading battery from {device.name}: {e}")
         
         return None
     
     def update_device_list(self):
         for i in reversed(range(self.menu.actions().index(self.devices_label), 
-                                len(self.menu.actions()) - 2)):
+                                len(self.menu.actions()) - 3)):
             action = self.menu.actions()[i]
             if action != self.devices_label:
                 self.menu.removeAction(action)
+        
+        status_text = f"Scanned {self.scan_count} times | Found: {len(self.all_devices)} devices"
+        if self.last_error:
+            status_text += f" | Error: {self.last_error[:30]}..."
+        self.status_action.setText(status_text)
+        
+        show_all = self.show_all_action.isChecked()
         
         if self.devices:
             self.menu.removeAction(self.devices_label)
             
             for address, info in self.devices.items():
-                device_text = f"{info['name']}: {info['battery']}%"
+                device_text = f"🔋 {info['name']}: {info['battery']}%"
                 device_action = QAction(device_text, self.app)
                 device_action.setEnabled(False)
-                self.menu.insertAction(self.quit_action, device_action)
+                self.menu.insertAction(self.help_action, device_action)
+            
+            if show_all and self.all_devices:
+                separator = QAction("─── All Discovered Devices ───", self.app)
+                separator.setEnabled(False)
+                self.menu.insertAction(self.help_action, separator)
+                
+                for address, info in self.all_devices.items():
+                    if address not in self.devices:
+                        rssi_text = f" ({info['rssi']} dBm)" if info['rssi'] else ""
+                        device_text = f"📡 {info['name']}{rssi_text}"
+                        device_action = QAction(device_text, self.app)
+                        device_action.setEnabled(False)
+                        self.menu.insertAction(self.help_action, device_action)
             
             highest_battery_device = max(self.devices.values(), 
                                         key=lambda x: x['battery'])
@@ -177,18 +236,63 @@ class BluetoothBatteryMonitor:
             )
         else:
             if self.devices_label not in self.menu.actions():
-                self.menu.insertAction(self.quit_action, self.devices_label)
+                self.menu.insertAction(self.help_action, self.devices_label)
+            
+            if show_all and self.all_devices:
+                separator = QAction("─── All Discovered Devices ───", self.app)
+                separator.setEnabled(False)
+                self.menu.insertAction(self.help_action, separator)
+                
+                for address, info in self.all_devices.items():
+                    rssi_text = f" ({info['rssi']} dBm)" if info['rssi'] else ""
+                    device_text = f"📡 {info['name']}{rssi_text}"
+                    device_action = QAction(device_text, self.app)
+                    device_action.setEnabled(False)
+                    self.menu.insertAction(self.help_action, device_action)
+            
             self.tray_icon.setIcon(self.create_battery_icon())
-            self.tray_icon.setToolTip("Bluetooth Battery Monitor\nNo devices found")
+            tooltip = f"Bluetooth Battery Monitor\nScanned: {len(self.all_devices)} devices"
+            if self.devices:
+                tooltip += f"\nWith battery: {len(self.devices)}"
+            else:
+                tooltip += "\nNo battery-enabled devices found"
+            self.tray_icon.setToolTip(tooltip)
     
     def manual_refresh(self):
         self.devices.clear()
+        self.all_devices.clear()
         self.tray_icon.showMessage(
             "Bluetooth Battery Monitor",
             "Refreshing devices...",
             QSystemTrayIcon.Information,
             2000
         )
+    
+    def show_help(self):
+        help_text = (
+            "<h3>Bluetooth Battery Monitor</h3>"
+            "<p><b>Troubleshooting:</b></p>"
+            "<ol>"
+            "<li><b>Pair your device:</b> Go to Windows Settings → Bluetooth & devices</li>"
+            "<li><b>Connect your device:</b> Make sure it's actively connected (not just paired)</li>"
+            "<li><b>Check compatibility:</b> Not all Bluetooth devices support battery reporting</li>"
+            "<li><b>Enable 'Show All Devices':</b> See all discovered Bluetooth devices</li>"
+            "</ol>"
+            "<p><b>Supported Devices:</b></p>"
+            "<ul>"
+            "<li>Most modern Bluetooth earphones/headphones</li>"
+            "<li>Devices with BLE Battery Service (GATT 0x180F)</li>"
+            "</ul>"
+            f"<p><b>Status:</b> Scanned {self.scan_count} times, found {len(self.all_devices)} devices total, "
+            f"{len(self.devices)} with battery support.</p>"
+        )
+        
+        msg_box = QMessageBox()
+        msg_box.setWindowTitle("Bluetooth Battery Monitor - Help")
+        msg_box.setTextFormat(Qt.RichText)
+        msg_box.setText(help_text)
+        msg_box.setIcon(QMessageBox.Information)
+        msg_box.exec_()
     
     def quit_app(self):
         self.scanner_running = False
